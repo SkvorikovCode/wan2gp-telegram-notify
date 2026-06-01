@@ -200,12 +200,14 @@ class TelegramNotifyPlugin(WAN2GPPlugin):
 
     def _do_notify(self, cfg, success, file_list):
         bot_token = cfg["bot_token"]
-        # Route notification to the chat that triggered the generation (if via bot),
-        # otherwise fall back to the primary configured chat_id.
-        requester = self._engine.get_requester_chat_id()
-        chat_id = requester if requester else cfg["chat_id"]
         send_file = cfg["send_file"]
         bot_enabled = cfg["bot_enabled"]
+
+        # UI-генерация всегда шлёт в основной chat_id.
+        # _requester_chat_id относится только к бот-генерациям — сбрасываем его.
+        self._engine._requester_chat_id = None
+        chat_id = cfg["chat_id"]
+
         with self._progress_msg_lock:
             msg_id = self._progress_message_id
             self._progress_message_id = None
