@@ -166,10 +166,13 @@ class TelegramBot:
         with state.lock:
             mid = state.panel_message_id
         if mid is not None:
-            ok, _ = tg.edit_message_text(token, chat_id, mid, text, reply_markup=keyboard)
+            ok, err = tg.edit_message_text(token, chat_id, mid, text, reply_markup=keyboard)
             if ok:
                 return
-            # Message was deleted externally — fall through to send a new one.
+            # "message is not modified" — content identical, panel is still there, do nothing.
+            if isinstance(err, str) and "not modified" in err.lower():
+                return
+            # Any other error (message deleted, too old, etc.) — fall through to send a new one.
         ok, result = tg.send_message(token, chat_id, text, reply_markup=keyboard)
         if ok and isinstance(result, dict):
             with state.lock:
