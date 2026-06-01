@@ -1,0 +1,9 @@
+{
+  "name": "Telegram Notify",
+  "author": "Denis",
+  "version": "2.0.0",
+  "description": "Telegram notifications plus a two-way control bot: regenerate, change prompt/model/settings, and abort generations from Telegram.",
+  "date": "",
+  "wan2gp_version": "",
+  "uninstallable": true
+}
