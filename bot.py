@@ -7,6 +7,7 @@ from any nested screen.
 
 Supported commands (also available as inline buttons):
   /start, /help    – show main menu
+  /hello           – show current settings and quick-launch panel
   /status          – current state
   /regen           – re-run last generation with a new seed
   /generate        – run with current settings
@@ -256,6 +257,7 @@ class TelegramBot:
         handler = {
             "start":      self._cmd_help,
             "help":       self._cmd_help,
+            "hello":      self._cmd_hello,
             "status":     self._cmd_status,
             "regen":      self._cmd_regen,
             "regenerate": self._cmd_regen,
@@ -317,6 +319,8 @@ class TelegramBot:
             self._cmd_regen(token, chat_id, "")
         elif action == "generate":
             self._cmd_generate(token, chat_id, "")
+        elif action == "hello":
+            self._show_hello_panel(token, chat_id)
         elif action == "prompt":
             self._cmd_prompt(token, chat_id, "")
         elif action == "model":
@@ -347,6 +351,54 @@ class TelegramBot:
 
     def _cmd_help(self, token: str, chat_id: str, _argument: str) -> None:
         self._show_main_menu(token, chat_id)
+
+    def _cmd_hello(self, token: str, chat_id: str, _argument: str) -> None:
+        self._show_hello_panel(token, chat_id)
+
+    def _show_hello_panel(self, token: str, chat_id: str) -> None:
+        busy = self._engine.is_busy()
+        settings = self._engine.get_last_settings()
+
+        lines = ["👋 <b>Ready to generate</b>"]
+
+        if settings:
+            model = settings.get("model_type", "")
+            lines.append(f"\n🧩 <b>Model:</b> <code>{_esc(self._engine.model_display_name(model))}</code>")
+
+            prompt = str(settings.get("prompt", "")).strip()
+            lines.append(f"✏️ <b>Prompt:</b> {_esc(prompt[:200]) if prompt else '—'}")
+
+            neg = str(settings.get("negative_prompt", "")).strip()
+            if neg:
+                lines.append(f"🚫 <b>Negative:</b> {_esc(neg[:100])}")
+
+            lines.append(
+                f"🔢 <b>Steps:</b> {_esc(settings.get('num_inference_steps', '?'))}  "
+                f"🎲 <b>Seed:</b> {_esc(settings.get('seed', '?'))}  "
+                f"📐 <b>Res:</b> {_esc(settings.get('resolution', '?'))}"
+            )
+
+            guidance = settings.get("guidance_scale")
+            frames = settings.get("video_length")
+            if guidance is not None or frames is not None:
+                extra = []
+                if guidance is not None:
+                    extra.append(f"🎯 <b>Guidance:</b> {_esc(guidance)}")
+                if frames is not None:
+                    extra.append(f"🎞 <b>Frames:</b> {_esc(frames)}")
+                lines.append("  ".join(extra))
+        else:
+            lines.append("\n⚠️ No settings yet — configure in the UI first or pick a model below.")
+
+        lines.append("\n" + ("🟡 Busy generating…" if busy else "🟢 Idle — pick an action:"))
+
+        keyboard = tg.inline_keyboard([
+            [("▶️ Generate", "act:generate"), ("🔁 New seed", "act:regen")],
+            [("✏️ Prompt", "act:prompt"), ("🧩 Model", "act:model")],
+            [("⚙️ Settings", "act:settings"), ("📊 Status", "act:status")],
+        ] + ([[("⏹ Abort", "act:abort")]] if busy else []))
+
+        self._show_panel(token, chat_id, "\n".join(lines), keyboard)
 
     def _cmd_status(self, token: str, chat_id: str, _argument: str) -> None:
         busy = self._engine.is_busy()
