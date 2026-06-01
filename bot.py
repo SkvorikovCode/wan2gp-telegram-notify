@@ -72,6 +72,22 @@ class _ChatState:
         self.pending: Optional[dict] = None            # waiting for free-text input
         self.model_page: int = 0
         self.lock = threading.Lock()
+        # Short-key → model_type map to stay within Telegram's 64-byte callback_data limit
+        self._model_key_map: dict[str, str] = {}
+        self._model_key_counter: int = 0
+
+    def register_model_key(self, model_type: str) -> str:
+        """Return a short key for model_type, creating one if needed."""
+        for k, v in self._model_key_map.items():
+            if v == model_type:
+                return k
+        self._model_key_counter += 1
+        key = str(self._model_key_counter)
+        self._model_key_map[key] = model_type
+        return key
+
+    def resolve_model_key(self, key: str) -> Optional[str]:
+        return self._model_key_map.get(key)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +110,11 @@ class TelegramBot:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
+        # Clear stale panel ids from a previous session so old messages don't
+        # accumulate with dead buttons after a restart.
+        for state in self._chats.values():
+            with state.lock:
+                state.panel_message_id = None
         self._thread = threading.Thread(target=self._run, daemon=True, name="tg-bot-poll")
         self._thread.start()
 
@@ -484,7 +505,10 @@ class TelegramBot:
             state.model_page = page
         start = page * page_size
         chunk = models[start:start + page_size]
-        rows = [[(name[:60], f"model:{model_type}")] for model_type, name in chunk]
+        rows = []
+        for model_type, name in chunk:
+            key = state.register_model_key(model_type)
+            rows.append([(name[:60], f"model:{key}")])
         nav = []
         if page > 0:
             nav.append(("⬅️ Prev", f"mpage:{page - 1}"))
@@ -499,7 +523,12 @@ class TelegramBot:
             tg.inline_keyboard(rows),
         )
 
-    def _select_model(self, token: str, chat_id: str, model_type: str) -> None:
+    def _select_model(self, token: str, chat_id: str, key: str) -> None:
+        state = self._state(chat_id)
+        model_type = state.resolve_model_key(key)
+        if not model_type:
+            self._show_panel(token, chat_id, "⚠️ Unknown model key, please reopen the model picker.", _back_keyboard())
+            return
         base = self._engine.get_last_settings()
         if not base:
             try:
@@ -523,6 +552,7 @@ class TelegramBot:
             settings,
             on_progress=lambda payload: self._on_progress(token, chat_id, payload),
             on_done=lambda result: self._on_done(token, chat_id, result),
+            requester_chat_id=chat_id,
         )
         if not ok:
             self._show_panel(token, chat_id, f"⚠️ {_esc(status_msg)}", _main_keyboard(False))

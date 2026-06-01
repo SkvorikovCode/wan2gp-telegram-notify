@@ -63,14 +63,14 @@ class GenerationEngine:
         self._wgp = None
         self._session = None
         self._session_lock = threading.Lock()
-        # Guards a single bot-launched generation at a time.
         self._gen_lock = threading.Lock()
-        # Per-generation settings store: gen_id -> settings (capped at _MAX_STORED_GENERATIONS).
         self._generations: OrderedDict[str, dict] = OrderedDict()
         self._generations_lock = threading.Lock()
-        # Live per-session state captured from the generation hooks; lets us
-        # abort a UI-launched generation and read its outputs.
         self._ui_state: Optional[dict] = None
+        self._requester_chat_id: Optional[str] = None
+
+    def get_requester_chat_id(self) -> Optional[str]:
+        return self._requester_chat_id
 
     # ------------------------------------------------------------------ wgp
     @property
@@ -82,21 +82,27 @@ class GenerationEngine:
         return self._wgp
 
     def _get_session(self):
-        """Lazily create the head-less API session (shares the loaded model)."""
+        """Lazily create the API session, reusing the already-loaded model via the UI queue."""
         if self._session is not None:
             return self._session
         with self._session_lock:
             if self._session is None:
                 api = importlib.import_module("shared.api")
-                # No output_dir override: inherit the UI's configured save
-                # paths so bot results land in the same gallery.
-                self._session = api.init(console_output=False)
+                # Pass the live UI state so the session routes through the
+                # already-loaded model instead of initialising a second runtime.
+                webui_state = self._ui_state if isinstance(self._ui_state, dict) else None
+                self._session = api.init(console_output=False, webui_state=webui_state)
             return self._session
 
     # -------------------------------------------------------------- capture
     def remember_ui_state(self, state: dict) -> None:
         if isinstance(state, dict):
             self._ui_state = state
+            # If the session was created without webui_state (before the first
+            # UI generation), drop it so the next bot job gets a proper session.
+            with self._session_lock:
+                if self._session is not None and not self._session._use_webui_queue:
+                    self._session = None
 
     def store_generation(self, settings: dict) -> str:
         """Store settings for a generation and return its gen_id."""
@@ -144,12 +150,19 @@ class GenerationEngine:
         if not isinstance(gen, dict):
             return None
         settings_list = gen.get("file_settings_list") or []
-        if not settings_list:
-            return None
-        latest = settings_list[-1]
-        if not isinstance(latest, dict):
-            return None
-        return self.store_generation(latest)
+        if settings_list:
+            latest = settings_list[-1]
+            if isinstance(latest, dict):
+                return self.store_generation(latest)
+        # Fallback: extract settings directly from the queue task (works even on failure)
+        queue = gen.get("queue") or []
+        if queue:
+            task = queue[-1]
+            if isinstance(task, dict):
+                params = task.get("params") or task.get("settings")
+                if isinstance(params, dict) and params:
+                    return self.store_generation(params)
+        return None
 
     # --------------------------------------------------------------- models
     def list_models(self) -> list[tuple[str, str]]:
@@ -237,11 +250,14 @@ class GenerationEngine:
         gen_id: Optional[str] = None,
         on_progress: Optional[Callable[[dict], None]] = None,
         on_done: Optional[Callable[[Any], None]] = None,
+        requester_chat_id: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Launch a head-less generation in a worker thread.
 
         Returns (accepted, gen_id_or_error). ``accepted`` is False if something
         is already running. Progress/results are delivered through callbacks.
+        ``requester_chat_id`` is stored so callers can route the result back to
+        the correct chat.
         """
         if self.is_busy():
             return False, "WanGP is busy with another generation."
@@ -251,9 +267,10 @@ class GenerationEngine:
         if gen_id is None:
             gen_id = self.store_generation(settings)
         else:
-            # Ensure the settings are stored under this gen_id.
             with self._generations_lock:
                 self._generations[gen_id] = copy.deepcopy(settings)
+
+        self._requester_chat_id = requester_chat_id
 
         def worker() -> None:
             callbacks = _EngineCallbacks(on_progress)

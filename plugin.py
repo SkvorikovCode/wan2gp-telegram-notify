@@ -92,6 +92,11 @@ class _ProgressWatcher:
     def stop(self):
         self._stop_event.set()
 
+    def stop_and_join(self, timeout=_UPDATE_INTERVAL + 1):
+        """Signal stop and wait for the thread to finish before returning."""
+        self._stop_event.set()
+        self._thread.join(timeout=timeout)
+
     def _run(self):
         while not self._stop_event.wait(_UPDATE_INTERVAL):
             if not self._gen.get("in_progress"):
@@ -108,6 +113,7 @@ class TelegramNotifyPlugin(WAN2GPPlugin):
         self.description = "Telegram notifications plus a two-way control bot (regenerate, change prompt/model/settings, abort)."
         self._watcher = None
         self._progress_message_id = None
+        self._progress_msg_lock = threading.Lock()
         self._engine = GenerationEngine()
         self._bot = TelegramBot(self._get_cfg, self._engine)
 
@@ -155,7 +161,8 @@ class TelegramNotifyPlugin(WAN2GPPlugin):
         ok, result = tg.send_message(cfg["bot_token"], cfg["chat_id"], start_text)
         msg_id = result.get("message_id") if ok and isinstance(result, dict) else None
         if msg_id:
-            self._progress_message_id = msg_id
+            with self._progress_msg_lock:
+                self._progress_message_id = msg_id
             self._watcher = _ProgressWatcher(cfg["bot_token"], cfg["chat_id"], msg_id, gen, task_count)
         elif not ok:
             print(f"[TelegramNotify] Failed to send start message: {result}")
@@ -178,7 +185,7 @@ class TelegramNotifyPlugin(WAN2GPPlugin):
             return configs
 
         if self._watcher is not None:
-            self._watcher.stop()
+            self._watcher.stop_and_join()
             self._watcher = None
 
         success = kwargs.get("success", False)
@@ -193,11 +200,15 @@ class TelegramNotifyPlugin(WAN2GPPlugin):
 
     def _do_notify(self, cfg, success, file_list):
         bot_token = cfg["bot_token"]
-        chat_id = cfg["chat_id"]
+        # Route notification to the chat that triggered the generation (if via bot),
+        # otherwise fall back to the primary configured chat_id.
+        requester = self._engine.get_requester_chat_id()
+        chat_id = requester if requester else cfg["chat_id"]
         send_file = cfg["send_file"]
         bot_enabled = cfg["bot_enabled"]
-        msg_id = self._progress_message_id
-        self._progress_message_id = None
+        with self._progress_msg_lock:
+            msg_id = self._progress_message_id
+            self._progress_message_id = None
 
         if success and file_list:
             latest = file_list[-1]
