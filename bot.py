@@ -118,6 +118,12 @@ class TelegramBot:
         self._thread = threading.Thread(target=self._run, daemon=True, name="tg-bot-poll")
         self._thread.start()
 
+    def _drain_pending_updates(self, token: str) -> None:
+        """Consume all queued updates without processing them to avoid replay on restart."""
+        ok, result = tg.get_updates(token, offset=self._offset, timeout=0)
+        if ok and result:
+            self._offset = result[-1].get("update_id", 0) + 1
+
     def stop(self) -> None:
         self._stop.set()
         self._thread = None
@@ -175,6 +181,13 @@ class TelegramBot:
     # ---------------------------------------------------------------- main loop
 
     def _run(self) -> None:
+        # Flush any updates that accumulated while the bot was offline so they
+        # are not replayed as fresh commands.
+        cfg = self._cfg()
+        token = str(cfg.get("bot_token", "")).strip()
+        if token:
+            self._drain_pending_updates(token)
+
         while not self._stop.is_set():
             cfg = self._cfg()
             token = str(cfg.get("bot_token", "")).strip()
