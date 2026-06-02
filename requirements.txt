@@ -1,0 +1,2 @@
+# Optional: required only when Proxy mode = SOCKS5
+PySocks>=1.7.1

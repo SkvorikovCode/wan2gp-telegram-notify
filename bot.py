@@ -13,7 +13,11 @@ Supported commands (also available as inline buttons):
   /generate        – run with current settings
   /prompt <text>   – set prompt (or opens text-input mode)
   /model           – model picker (paginated)
-  /settings        – editable settings list
+  /settings        – settings hub (General / LoRAs / Post / Quality / …)
+  /loras           – toggle LoRAs and edit multipliers
+  /image           – set start image (i2v); then send a photo
+  /endimage        – set end image; then send a photo
+  /clearimage      – remove start/end images
   /set key value   – change one setting
   /abort           – stop running generation
   /cancel          – cancel any pending input and return to main menu
@@ -22,12 +26,26 @@ Supported commands (also available as inline buttons):
 from __future__ import annotations
 
 import html
+import os
 import threading
 import time
 from typing import Any, Optional
 
 from . import telegram_api as tg
-from .engine import EDITABLE_SETTINGS, GenerationEngine, _coerce
+from .engine import (
+    EDITABLE_SETTINGS,
+    SETTINGS_CODE_TO_SECTION,
+    SETTINGS_SECTION_CODES,
+    SETTINGS_SECTION_ORDER,
+    SETTINGS_SECTIONS,
+    GenerationEngine,
+    _coerce,
+    format_setting_display,
+    section_keys,
+)
+
+_SETTINGS_PAGE_SIZE = 6
+_LORA_PAGE_SIZE = 8
 
 
 # ---------------------------------------------------------------------------
@@ -38,11 +56,32 @@ def _esc(value: Any) -> str:
     return html.escape(str(value), quote=False)
 
 
+def _section_emoji(section: str) -> str:
+    return {
+        "General": "⚙️",
+        "LoRAs": "🎭",
+        "Post Processing": "🎞️",
+        "Quality": "✨",
+        "Sliding Window": "🪟",
+        "Misc": "🔧",
+    }.get(section, "•")
+
+
+def _settings_hub_keyboard() -> dict:
+    rows = [
+        [(f"{_section_emoji(s)} {s}", f"sec:{SETTINGS_SECTION_CODES[s]}")]
+        for s in SETTINGS_SECTION_ORDER
+    ]
+    rows.append(_back_cancel_row())
+    return tg.inline_keyboard(rows)
+
+
 def _main_keyboard(busy: bool) -> dict:
     rows = [
         [("🔁 Regenerate", "act:regen"), ("▶️ Generate", "act:generate")],
         [("✏️ Prompt", "act:prompt"), ("🧩 Model", "act:model")],
-        [("⚙️ Settings", "act:settings"), ("📊 Status", "act:status")],
+        [("⚙️ Settings", "act:settings"), ("🎭 LoRAs", "act:loras")],
+        [("📷 Start image", "act:image"), ("📊 Status", "act:status")],
     ]
     if busy:
         rows.append([("⏹ Abort", "act:abort")])
@@ -61,6 +100,17 @@ def _back_cancel_row() -> list:
     return [("◀️ Back", "act:back"), ("✖ Cancel", "act:cancel")]
 
 
+def _extract_image_file_id(message: dict) -> Optional[str]:
+    photos = message.get("photo") or []
+    if photos:
+        return str(photos[-1].get("file_id", "") or "") or None
+    doc = message.get("document") or {}
+    mime = str(doc.get("mime_type", "") or "").lower()
+    if mime.startswith("image/"):
+        return str(doc.get("file_id", "") or "") or None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Per-chat state
 # ---------------------------------------------------------------------------
@@ -76,6 +126,11 @@ class _ChatState:
         # Short-key → model_type map to stay within Telegram's 64-byte callback_data limit
         self._model_key_map: dict[str, str] = {}
         self._model_key_counter: int = 0
+        self.settings_section: str = "General"
+        self.settings_page: int = 0
+        self.lora_page: int = 0
+        self._lora_key_map: dict[str, str] = {}
+        self._lora_key_counter: int = 0
 
     def register_model_key(self, model_type: str) -> str:
         """Return a short key for model_type, creating one if needed."""
@@ -89,6 +144,18 @@ class _ChatState:
 
     def resolve_model_key(self, key: str) -> Optional[str]:
         return self._model_key_map.get(key)
+
+    def register_lora_key(self, basename: str) -> str:
+        for k, v in self._lora_key_map.items():
+            if v == basename:
+                return k
+        self._lora_key_counter += 1
+        key = f"l{self._lora_key_counter}"
+        self._lora_key_map[key] = basename
+        return key
+
+    def resolve_lora_key(self, key: str) -> Optional[str]:
+        return self._lora_key_map.get(key)
 
 
 # ---------------------------------------------------------------------------
@@ -221,18 +288,46 @@ class TelegramBot:
         chat_id = str(message.get("chat", {}).get("id", ""))
         msg_id: int = message.get("message_id", 0)
         text = (message.get("text") or "").strip()
+        file_id = _extract_image_file_id(message)
         if not chat_id:
             return
 
-        # Always delete the user's message to keep the chat clean.
-        if msg_id:
-            self._delete_message(token, chat_id, msg_id)
-
         if not self._is_authorized(chat_id):
+            if msg_id:
+                self._delete_message(token, chat_id, msg_id)
             tg.send_message(token, chat_id, "⛔ This chat is not authorized.")
             return
 
         state = self._state(chat_id)
+
+        if file_id:
+            pending = state.pending
+            slot = "start"
+            if isinstance(pending, dict):
+                mode = pending.get("mode", "")
+                if mode == "image_end":
+                    slot = "end"
+                elif mode == "image_start":
+                    slot = "start"
+                elif mode in ("prompt",) or str(mode).startswith("set:") or mode == "loras_mults":
+                    if msg_id:
+                        self._delete_message(token, chat_id, msg_id)
+                    self._show_panel(
+                        token, chat_id,
+                        "⚠️ Finish the current input first, or tap ✖ Cancel.",
+                        _cancel_keyboard(),
+                    )
+                    return
+            if msg_id:
+                self._delete_message(token, chat_id, msg_id)
+            with state.lock:
+                state.pending = None
+            self._apply_telegram_image(token, chat_id, file_id, slot)
+            return
+
+        # Delete text commands to keep the chat clean.
+        if msg_id:
+            self._delete_message(token, chat_id, msg_id)
 
         # /cancel always wins.
         if text.lstrip("/").lower().split("@")[0] == "cancel":
@@ -243,7 +338,7 @@ class TelegramBot:
 
         # Free-text follow-up (prompt entry or /set value).
         pending = state.pending
-        if pending and not text.startswith("/"):
+        if pending and text and not text.startswith("/"):
             self._consume_pending(token, chat_id, pending, text)
             return
 
@@ -265,6 +360,11 @@ class TelegramBot:
             "prompt":     self._cmd_prompt,
             "model":      lambda t, c, a: self._show_model_picker(t, c, 0),
             "settings":   self._cmd_settings,
+            "loras":      self._cmd_loras,
+            "image":      self._cmd_image,
+            "startimage": self._cmd_image,
+            "endimage":   self._cmd_endimage,
+            "clearimage": self._cmd_clearimage,
             "set":        self._cmd_set,
             "abort":      self._cmd_abort,
             "stop":       self._cmd_abort,
@@ -303,6 +403,23 @@ class TelegramBot:
             self._show_model_picker(token, chat_id, int(payload or 0))
         elif kind == "set":
             self._prompt_for_setting(token, chat_id, payload)
+        elif kind == "sec":
+            section = SETTINGS_CODE_TO_SECTION.get(payload)
+            if section:
+                self._show_settings_section(token, chat_id, section, 0)
+        elif kind == "spage":
+            code, _, page_s = payload.partition(":")
+            section = SETTINGS_CODE_TO_SECTION.get(code)
+            if section:
+                self._show_settings_section(token, chat_id, section, int(page_s or 0))
+        elif kind == "sw":
+            self._toggle_switch_setting(token, chat_id, payload)
+        elif kind == "lt":
+            self._toggle_lora(token, chat_id, payload)
+        elif kind == "lpage":
+            self._show_loras_panel(token, chat_id, int(payload or 0))
+        elif kind == "loram":
+            self._prompt_lora_multipliers(token, chat_id)
 
     def _dispatch_action(self, token: str, chat_id: str, action: str) -> None:
         if action == "cancel":
@@ -327,6 +444,20 @@ class TelegramBot:
             self._show_model_picker(token, chat_id, 0)
         elif action == "settings":
             self._cmd_settings(token, chat_id, "")
+        elif action == "loras":
+            self._cmd_loras(token, chat_id, "")
+        elif action == "settings_hub":
+            self._show_settings_hub(token, chat_id)
+        elif action == "lora_clear":
+            self._engine.set_active_loras([], "")
+            state = self._state(chat_id)
+            self._show_loras_panel(token, chat_id, state.lora_page)
+        elif action == "image":
+            self._cmd_image(token, chat_id, "")
+        elif action == "endimage":
+            self._cmd_endimage(token, chat_id, "")
+        elif action == "clearimage":
+            self._cmd_clearimage(token, chat_id, "")
         elif action == "status":
             self._cmd_status(token, chat_id, "")
         elif action == "abort":
@@ -344,6 +475,11 @@ class TelegramBot:
             prompt = str(settings.get("prompt", ""))
             if prompt:
                 lines.append(f"Prompt: {_esc(prompt[:120])}")
+            img_start, img_end = self._engine.get_image_paths_summary()
+            if img_start:
+                lines.append(f"📷 Start: <code>{_esc(img_start)}</code>")
+            if img_end:
+                lines.append(f"📷 End: <code>{_esc(img_end)}</code>")
         lines.append("🟡 Busy generating…" if busy else "🟢 Idle")
         self._show_panel(token, chat_id, "\n".join(lines), _main_keyboard(busy))
 
@@ -377,6 +513,18 @@ class TelegramBot:
                 f"🎲 <b>Seed:</b> {_esc(settings.get('seed', '?'))}  "
                 f"📐 <b>Res:</b> {_esc(settings.get('resolution', '?'))}"
             )
+            active_loras, mults = self._engine.get_active_loras()
+            if active_loras:
+                lines.append(f"🎭 <b>LoRAs:</b> {_esc(', '.join(active_loras[:5]))}"
+                             + ("…" if len(active_loras) > 5 else ""))
+                if mults.strip():
+                    lines.append(f"   <i>mult:</i> <code>{_esc(mults[:80])}</code>")
+
+            img_start, img_end = self._engine.get_image_paths_summary()
+            if img_start:
+                lines.append(f"📷 <b>Start image:</b> <code>{_esc(img_start)}</code>")
+            if img_end:
+                lines.append(f"📷 <b>End image:</b> <code>{_esc(img_end)}</code>")
 
             guidance = settings.get("guidance_scale")
             frames = settings.get("video_length")
@@ -395,7 +543,8 @@ class TelegramBot:
         keyboard = tg.inline_keyboard([
             [("▶️ Generate", "act:generate"), ("🔁 New seed", "act:regen")],
             [("✏️ Prompt", "act:prompt"), ("🧩 Model", "act:model")],
-            [("⚙️ Settings", "act:settings"), ("📊 Status", "act:status")],
+            [("⚙️ Settings", "act:settings"), ("🎭 LoRAs", "act:loras")],
+            [("📷 Start image", "act:image"), ("📊 Status", "act:status")],
         ] + ([[("⏹ Abort", "act:abort")]] if busy else []))
 
         self._show_panel(token, chat_id, "\n".join(lines), keyboard)
@@ -415,6 +564,14 @@ class TelegramBot:
                 f"Seed {_esc(settings.get('seed', '?'))} · "
                 f"{_esc(settings.get('resolution', '?'))}"
             )
+            img_start, img_end = self._engine.get_image_paths_summary()
+            if img_start or img_end:
+                parts = []
+                if img_start:
+                    parts.append(f"start <code>{_esc(img_start)}</code>")
+                if img_end:
+                    parts.append(f"end <code>{_esc(img_end)}</code>")
+                lines.append("📷 " + " · ".join(parts))
         else:
             lines.append("No generation captured yet. Run one from the UI first.")
         self._show_panel(token, chat_id, "\n".join(lines), _main_keyboard(busy))
@@ -443,6 +600,71 @@ class TelegramBot:
         settings = self._engine.build_settings(base, {}, new_seed=False)
         self._launch(token, chat_id, settings, "▶️ Generating with current settings…")
 
+    def _cmd_image(self, token: str, chat_id: str, _argument: str) -> None:
+        if not self._require_settings(token, chat_id):
+            return
+        state = self._state(chat_id)
+        with state.lock:
+            state.pending = {"mode": "image_start"}
+        self._show_panel(
+            token, chat_id,
+            "📷 <b>Start image (i2v)</b>\n\nSend a photo in this chat.\n"
+            "You can also send a photo anytime — it will be used as the start frame.",
+            _cancel_keyboard(),
+        )
+
+    def _cmd_endimage(self, token: str, chat_id: str, _argument: str) -> None:
+        if not self._require_settings(token, chat_id):
+            return
+        state = self._state(chat_id)
+        with state.lock:
+            state.pending = {"mode": "image_end"}
+        self._show_panel(
+            token, chat_id,
+            "📷 <b>End image</b>\n\nSend a photo to use as the last frame.",
+            _cancel_keyboard(),
+        )
+
+    def _cmd_clearimage(self, token: str, chat_id: str, _argument: str) -> None:
+        if not self._require_settings(token, chat_id):
+            return
+        self._engine.clear_image_attachment("start")
+        self._engine.clear_image_attachment("end")
+        self._show_panel(
+            token, chat_id,
+            "🗑 Start and end images cleared.",
+            tg.inline_keyboard([
+                [("📷 Start image", "act:image"), ("◀️ Menu", "act:back")],
+            ]),
+        )
+
+    def _apply_telegram_image(self, token: str, chat_id: str, file_id: str, slot: str) -> None:
+        self._cfg()
+        if not self._require_settings(token, chat_id):
+            return
+        ok, path_or_err = self._engine.save_telegram_image(token, file_id, chat_id, slot=slot)
+        if not ok:
+            self._show_panel(
+                token, chat_id,
+                f"⚠️ Could not download image: {_esc(path_or_err)}",
+                _back_keyboard(),
+            )
+            return
+        ok, msg = self._engine.set_image_attachment(slot, path_or_err)
+        if not ok:
+            self._show_panel(token, chat_id, f"⚠️ {_esc(msg)}", _back_keyboard())
+            return
+        label = "Start image" if slot == "start" else "End image"
+        keyboard = tg.inline_keyboard([
+            [("▶️ Generate", "act:generate"), ("🔁 New seed", "act:regen")],
+            [("✏️ Prompt", "act:prompt"), ("◀️ Menu", "act:back")],
+        ])
+        self._show_panel(
+            token, chat_id,
+            f"✅ <b>{label}</b> set: <code>{_esc(msg)}</code>",
+            keyboard,
+        )
+
     def _cmd_prompt(self, token: str, chat_id: str, argument: str) -> None:
         if argument:
             self._apply_setting(token, chat_id, "prompt", argument, offer_generate=True)
@@ -456,26 +678,188 @@ class TelegramBot:
             _cancel_keyboard(),
         )
 
-    def _cmd_settings(self, token: str, chat_id: str, _argument: str) -> None:
+    def _require_settings(self, token: str, chat_id: str) -> Optional[dict]:
         settings = self._engine.get_last_settings()
         if not settings:
             self._show_panel(
                 token, chat_id,
-                "⚠️ No settings captured yet. Generate once from the UI first.",
+                "⚠️ No settings captured yet. Generate once from the UI or pick a model.",
                 _back_keyboard(),
             )
+            return None
+        return settings
+
+    def _cmd_settings(self, token: str, chat_id: str, _argument: str) -> None:
+        if not self._require_settings(token, chat_id):
             return
-        lines = ["<b>⚙️ Editable settings</b>"]
+        self._show_settings_hub(token, chat_id)
+
+    def _cmd_loras(self, token: str, chat_id: str, _argument: str) -> None:
+        if not self._require_settings(token, chat_id):
+            return
+        self._show_loras_panel(token, chat_id, 0)
+
+    def _show_settings_hub(self, token: str, chat_id: str) -> None:
+        self._show_panel(
+            token, chat_id,
+            "<b>⚙️ Settings</b>\nChoose a section:",
+            _settings_hub_keyboard(),
+        )
+
+    def _show_settings_section(self, token: str, chat_id: str, section: str, page: int) -> None:
+        if section == "LoRAs":
+            self._show_loras_panel(token, chat_id, page)
+            return
+        settings = self._require_settings(token, chat_id)
+        if not settings:
+            return
+        items = SETTINGS_SECTIONS.get(section, [])
+        if not items:
+            self._show_settings_hub(token, chat_id)
+            return
+        state = self._state(chat_id)
+        with state.lock:
+            state.settings_section = section
+            state.settings_page = page
+        page = max(0, min(page, max(0, (len(items) - 1) // _SETTINGS_PAGE_SIZE)))
+        start = page * _SETTINGS_PAGE_SIZE
+        chunk = items[start:start + _SETTINGS_PAGE_SIZE]
+        lines = [f"<b>{_section_emoji(section)} {_esc(section)}</b>"]
         rows = []
-        for key, meta in EDITABLE_SETTINGS.items():
-            value = settings.get(key, "—")
-            shown = str(value)
-            if len(shown) > 50:
-                shown = shown[:47] + "…"
-            lines.append(f"• <b>{_esc(meta['label'])}</b>: {_esc(shown)}")
-            rows.append([(f"✏️ {meta['label']}", f"set:{key}")])
-        rows.append(_back_cancel_row())
+        for key, meta in chunk:
+            value = settings.get(key)
+            shown = format_setting_display(key, value)
+            hint = meta.get("hint")
+            line = f"• <b>{_esc(meta['label'])}</b>: <code>{_esc(shown)}</code>"
+            if hint:
+                line += f"\n  <i>{_esc(hint)}</i>"
+            lines.append(line)
+            if meta.get("type") == "switch":
+                rows.append([
+                    (f"{'🟢' if int(value or 0) else '⚪'} {meta['label'][:28]}", f"sw:{key}"),
+                    (f"✏️ Set", f"set:{key}"),
+                ])
+            else:
+                rows.append([(f"✏️ {meta['label'][:32]}", f"set:{key}")])
+        nav = []
+        code = SETTINGS_SECTION_CODES[section]
+        if page > 0:
+            nav.append(("⬅️", f"spage:{code}:{page - 1}"))
+        if start + _SETTINGS_PAGE_SIZE < len(items):
+            nav.append(("➡️", f"spage:{code}:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([("◀️ Sections", "act:settings_hub"), ("✖ Cancel", "act:cancel")])
+        total_pages = max(1, (len(items) + _SETTINGS_PAGE_SIZE - 1) // _SETTINGS_PAGE_SIZE)
+        lines.append(f"\n<i>Page {page + 1}/{total_pages}</i>")
         self._show_panel(token, chat_id, "\n".join(lines), tg.inline_keyboard(rows))
+
+    def _toggle_switch_setting(self, token: str, chat_id: str, key: str) -> None:
+        meta = EDITABLE_SETTINGS.get(key)
+        if not meta or meta.get("type") != "switch":
+            return
+        base = self._require_settings(token, chat_id)
+        if not base:
+            return
+        current = int(base.get(key, 0) or 0)
+        base[key] = 0 if current else 1
+        self._engine.set_last_settings(base)
+        state = self._state(chat_id)
+        with state.lock:
+            section = state.settings_section
+            page = state.settings_page
+        self._show_settings_section(token, chat_id, section, page)
+
+    def _show_loras_panel(self, token: str, chat_id: str, page: int) -> None:
+        settings = self._require_settings(token, chat_id)
+        if not settings:
+            return
+        model_type = settings.get("model_type", "")
+        all_loras = self._engine.list_loras(model_type)
+        active, mults = self._engine.get_active_loras()
+        active_set = set(active)
+
+        state = self._state(chat_id)
+        with state.lock:
+            state.lora_page = page
+            state.settings_section = "LoRAs"
+
+        lines = [
+            f"<b>🎭 LoRAs</b> — <code>{_esc(self._engine.model_display_name(model_type))}</code>",
+            f"Active: <b>{len(active)}</b>",
+        ]
+        if active:
+            lines.append("✅ " + ", ".join(_esc(n) for n in active[:6])
+                       + ("…" if len(active) > 6 else ""))
+        if mults.strip():
+            lines.append(f"Multipliers: <code>{_esc(mults[:120])}</code>")
+        else:
+            lines.append("<i>Multipliers: 1 per LoRA (default)</i>")
+
+        if not all_loras:
+            lines.append("\n⚠️ No LoRA files in this model's folder.")
+            rows = [
+                [("✏️ Edit multipliers", "loram:")],
+                [("◀️ Sections", "act:settings_hub"), ("◀️ Menu", "act:back")],
+            ]
+            self._show_panel(token, chat_id, "\n".join(lines), tg.inline_keyboard(rows))
+            return
+
+        page = max(0, min(page, max(0, (len(all_loras) - 1) // _LORA_PAGE_SIZE)))
+        start = page * _LORA_PAGE_SIZE
+        chunk = all_loras[start:start + _LORA_PAGE_SIZE]
+        rows = []
+        for basename in chunk:
+            key = state.register_lora_key(basename)
+            mark = "✅" if basename in active_set else "⬜"
+            short = basename if len(basename) <= 36 else basename[:33] + "…"
+            rows.append([(f"{mark} {short}", f"lt:{key}")])
+        nav = []
+        if page > 0:
+            nav.append(("⬅️", f"lpage:{page - 1}"))
+        if start + _LORA_PAGE_SIZE < len(all_loras):
+            nav.append(("➡️", f"lpage:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([("✏️ Multipliers", "loram:"), ("🗑 Clear all", "act:lora_clear")])
+        rows.append([("◀️ Sections", "act:settings_hub"), ("◀️ Menu", "act:back")])
+        total_pages = max(1, (len(all_loras) + _LORA_PAGE_SIZE - 1) // _LORA_PAGE_SIZE)
+        lines.append(f"\n<i>Page {page + 1}/{total_pages} · tap to toggle</i>")
+        self._show_panel(token, chat_id, "\n".join(lines), tg.inline_keyboard(rows))
+
+    def _toggle_lora(self, token: str, chat_id: str, lora_key: str) -> None:
+        settings = self._require_settings(token, chat_id)
+        if not settings:
+            return
+        state = self._state(chat_id)
+        basename = state.resolve_lora_key(lora_key)
+        if not basename:
+            self._show_loras_panel(token, chat_id, state.lora_page)
+            return
+        active, mults = self._engine.get_active_loras()
+        if basename in active:
+            active = [n for n in active if n != basename]
+        else:
+            active = active + [basename]
+        self._engine.set_active_loras(active, mults)
+        self._show_loras_panel(token, chat_id, state.lora_page)
+
+    def _prompt_lora_multipliers(self, token: str, chat_id: str) -> None:
+        if not self._require_settings(token, chat_id):
+            return
+        active, mults = self._engine.get_active_loras()
+        state = self._state(chat_id)
+        with state.lock:
+            state.pending = {"mode": "loras_mults"}
+        example = "1 0.8 1" if len(active) > 1 else "1"
+        self._show_panel(
+            token, chat_id,
+            "✏️ <b>LoRA multipliers</b>\n\n"
+            f"Active ({len(active)}): {_esc(', '.join(active) or 'none')}\n\n"
+            f"Current: <code>{_esc(mults or example)}</code>\n\n"
+            "Send space-separated values (one per active LoRA), or WanGP strings like <code>0;1</code>.",
+            _cancel_keyboard(),
+        )
 
     def _cmd_set(self, token: str, chat_id: str, argument: str) -> None:
         key, _, value = argument.partition(" ")
@@ -522,6 +906,11 @@ class TelegramBot:
         mode = pending.get("mode", "")
         if mode == "prompt":
             self._apply_setting(token, chat_id, "prompt", text, offer_generate=True)
+        elif mode == "loras_mults":
+            active, _ = self._engine.get_active_loras()
+            self._engine.set_active_loras(active, text.strip())
+            state = self._state(chat_id)
+            self._show_loras_panel(token, chat_id, state.lora_page)
         elif mode.startswith("set:"):
             self._apply_setting(token, chat_id, mode[4:], text, offer_generate=True)
 
@@ -548,13 +937,13 @@ class TelegramBot:
             return
         base[key] = value
         self._engine.set_last_settings(base)
-        confirm = f"✅ <b>{_esc(meta['label'])}</b> set to <code>{_esc(value)}</code>."
+        shown = format_setting_display(key, value)
+        confirm = f"✅ <b>{_esc(meta['label'])}</b> → <code>{_esc(shown)}</code>"
         if offer_generate:
-            keyboard = tg.inline_keyboard([[
-                ("▶️ Generate", "act:generate"),
-                ("🔁 New seed", "act:regen"),
-                ("◀️ Back", "act:back"),
-            ]])
+            keyboard = tg.inline_keyboard([
+                [("▶️ Generate", "act:generate"), ("🔁 New seed", "act:regen")],
+                [("⚙️ Settings", "act:settings"), ("◀️ Menu", "act:back")],
+            ])
         else:
             keyboard = _back_keyboard()
         self._show_panel(token, chat_id, confirm, keyboard)
@@ -682,7 +1071,6 @@ class TelegramBot:
         cfg = self._cfg()
 
         if success and files:
-            import os
             latest = files[-1]
             caption = f"✅ <b>Generation complete</b>\n<code>{_esc(os.path.basename(latest))}</code>"
             if cfg.get("send_file") and latest:

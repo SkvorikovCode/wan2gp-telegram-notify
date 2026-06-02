@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +18,133 @@ import uuid
 from typing import Any, Optional
 
 _API_BASE = "https://api.telegram.org/bot{token}/{method}"
+_USER_AGENT = "Wan2GPTelegramNotify/2.0"
+_OPENER: Optional[urllib.request.OpenerDirector] = None
+_PROXY_MODE: str = "direct"
+_PROXY_URL: str = ""
+_PROXY_USER: str = ""
+_PROXY_PASSWORD: str = ""
+_PROXY_FINGERPRINT: tuple[str, str, str, str] = ("direct", "", "", "")
+
+
+def configure_network(
+    proxy_mode: str = "direct",
+    proxy_url: str = "",
+    proxy_user: str = "",
+    proxy_password: str = "",
+) -> None:
+    """Apply proxy settings from the plugin UI (call before Telegram API requests)."""
+    global _OPENER, _PROXY_MODE, _PROXY_URL, _PROXY_USER, _PROXY_PASSWORD, _PROXY_FINGERPRINT
+    mode = (proxy_mode or "direct").strip().lower()
+    url = (proxy_url or "").strip()
+    user = (proxy_user or "").strip()
+    password = proxy_password or ""
+    fingerprint = (mode, url, user, password)
+    if fingerprint == _PROXY_FINGERPRINT and _OPENER is not None:
+        return
+    _PROXY_MODE, _PROXY_URL, _PROXY_USER, _PROXY_PASSWORD = mode, url, user, password
+    _PROXY_FINGERPRINT = fingerprint
+    _OPENER = None
+
+
+def _inject_proxy_auth(proxy_url: str, user: str, password: str) -> str:
+    """Add login:password to proxy URL if not already embedded."""
+    if not user and not password:
+        return proxy_url
+    parsed = urllib.parse.urlparse(proxy_url)
+    if parsed.username:
+        return proxy_url
+    auth_user = urllib.parse.quote(user, safe="")
+    auth_pass = urllib.parse.quote(password, safe="")
+    host = parsed.hostname or ""
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    netloc = f"{auth_user}:{auth_pass}@{host}"
+    return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+
+
+def _normalize_proxy_url(
+    mode: str,
+    url: str,
+    *,
+    user: str = "",
+    password: str = "",
+) -> Optional[str]:
+    mode = (mode or "direct").strip().lower()
+    if mode in ("", "direct", "none", "off"):
+        return None
+    if mode == "system":
+        return None
+    raw = (url or "").strip()
+    if not raw:
+        env_url = (os.environ.get("TG_BOT_PROXY") or "").strip()
+        if env_url:
+            raw = env_url if "://" in env_url else f"http://{env_url}"
+        else:
+            return None
+    if "://" not in raw and "@" in raw:
+        scheme = "socks5h" if mode in ("socks5", "socks5h", "socks") else "http"
+        raw = f"{scheme}://{raw}"
+    elif "://" not in raw:
+        if mode in ("socks5", "socks5h", "socks"):
+            raw = f"socks5h://{raw}"
+        else:
+            raw = f"http://{raw}"
+    return _inject_proxy_auth(raw, user, password)
+
+
+def _get_opener() -> urllib.request.OpenerDirector:
+    global _OPENER
+    if _OPENER is not None:
+        return _OPENER
+
+    mode = _PROXY_MODE
+    if mode == "system":
+        _OPENER = urllib.request.build_opener()
+        return _OPENER
+
+    proxy_url = _normalize_proxy_url(
+        mode, _PROXY_URL, user=_PROXY_USER, password=_PROXY_PASSWORD
+    )
+    if not proxy_url:
+        _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return _OPENER
+
+    if proxy_url.startswith("socks"):
+        try:
+            import socks  # noqa: F401  # PySocks
+        except ImportError as exc:
+            raise RuntimeError(
+                "SOCKS5 proxy needs PySocks in the WanGP venv: pip install PySocks"
+            ) from exc
+
+    _OPENER = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    )
+    return _OPENER
+
+
+def _request(
+    req: urllib.request.Request,
+    *,
+    timeout: float,
+    attempts: int = 3,
+) -> bytes:
+    """GET/POST with retries on transient connection resets."""
+    opener = _get_opener()
+    last_exc: Optional[Exception] = None
+    for attempt in range(max(1, attempts)):
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < attempts:
+                time.sleep(1.0 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 def _call(bot_token: str, method: str, params: dict, timeout: float = 15.0) -> tuple[bool, Any]:
@@ -34,20 +162,37 @@ def _call(bot_token: str, method: str, params: dict, timeout: float = 15.0) -> t
             encoded[key] = value
     data = urllib.parse.urlencode(encoded).encode()
     try:
-        req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8", "replace"))
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"User-Agent": _USER_AGENT},
+        )
+        raw = _request(req, timeout=timeout, attempts=3)
+        body = json.loads(raw.decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         try:
             body = json.loads(exc.read().decode("utf-8", "replace"))
             return False, body.get("description", str(exc))
         except Exception:
             return False, f"HTTP {exc.code}"
-    except Exception as exc:
+    except RuntimeError as exc:
         return False, str(exc)
+    except Exception as exc:
+        return False, _friendly_network_error(exc)
     if not body.get("ok"):
         return False, body.get("description", "unknown error")
     return True, body.get("result")
+
+
+def _friendly_network_error(exc: Exception) -> str:
+    text = str(exc).strip()
+    if "10054" in text or "forcibly closed" in text.lower() or "connection reset" in text.lower():
+        return (
+            "Connection to Telegram was reset. "
+            "If you use a VPN/proxy (Clash, V2Ray), allow direct access to api.telegram.org "
+            "or disable the system proxy while WanGP runs."
+        )
+    return text or "network error"
 
 
 def send_message(
@@ -158,6 +303,33 @@ def get_me(bot_token: str) -> tuple[bool, Any]:
     return _call(bot_token, "getMe", {})
 
 
+def get_file(bot_token: str, file_id: str) -> tuple[bool, Any]:
+    """Resolve a Telegram file_id to a file_path on Telegram servers."""
+    return _call(bot_token, "getFile", {"file_id": file_id})
+
+
+def download_telegram_file(
+    bot_token: str,
+    telegram_file_path: str,
+    dest_path: str,
+    *,
+    timeout: float = 180.0,
+) -> tuple[bool, str]:
+    """Download a file from Telegram's CDN to a local path."""
+    url = f"https://api.telegram.org/file/bot{bot_token}/{telegram_file_path.lstrip('/')}"
+    try:
+        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+        data = _request(req, timeout=timeout, attempts=5)
+        with open(dest_path, "wb") as handle:
+            handle.write(data)
+        return True, dest_path
+    except RuntimeError as exc:
+        return False, str(exc)
+    except Exception as exc:
+        return False, _friendly_network_error(exc)
+
+
 def send_file(
     bot_token: str,
     chat_id: str,
@@ -214,11 +386,14 @@ def send_file(
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": _USER_AGENT,
+        },
     )
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            payload = json.loads(resp.read().decode("utf-8", "replace"))
+        raw = _request(req, timeout=300, attempts=3)
+        payload = json.loads(raw.decode("utf-8", "replace"))
         if not payload.get("ok"):
             return False, payload.get("description", "upload failed")
         return True, payload.get("result")
@@ -228,8 +403,10 @@ def send_file(
             return False, payload.get("description", str(exc))
         except Exception:
             return False, f"HTTP {exc.code}"
-    except Exception as exc:
+    except RuntimeError as exc:
         return False, str(exc)
+    except Exception as exc:
+        return False, _friendly_network_error(exc)
 
 
 # ----------------------------------------------------------------------------

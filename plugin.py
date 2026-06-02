@@ -18,6 +18,17 @@ _SEND_FILE_KEY = "tg_send_file"
 _ENABLED_KEY = "tg_enabled"
 _BOT_ENABLED_KEY = "tg_bot_enabled"
 _ALLOWED_IDS_KEY = "tg_allowed_chat_ids"
+_PROXY_MODE_KEY = "tg_proxy_mode"
+_PROXY_URL_KEY = "tg_proxy_url"
+_PROXY_USER_KEY = "tg_proxy_user"
+_PROXY_PASSWORD_KEY = "tg_proxy_password"
+
+_PROXY_MODE_CHOICES = [
+    ("Direct (no proxy)", "direct"),
+    ("HTTP proxy", "http"),
+    ("SOCKS5 proxy", "socks5"),
+    ("System proxy (Windows)", "system"),
+]
 
 _UPDATE_INTERVAL = 5  # seconds between progress message edits
 
@@ -30,16 +41,47 @@ def _load_config(server_config: dict) -> dict:
         "chat_id": str(server_config.get(_CHAT_ID_KEY, "") or ""),
         "allowed_chat_ids": str(server_config.get(_ALLOWED_IDS_KEY, "") or ""),
         "send_file": bool(server_config.get(_SEND_FILE_KEY, False)),
+        "proxy_mode": str(server_config.get(_PROXY_MODE_KEY, "direct") or "direct"),
+        "proxy_url": str(server_config.get(_PROXY_URL_KEY, "") or ""),
+        "proxy_user": str(server_config.get(_PROXY_USER_KEY, "") or ""),
+        "proxy_password": str(server_config.get(_PROXY_PASSWORD_KEY, "") or ""),
     }
 
 
-def _save_config(server_config, server_config_filename, *, enabled, bot_enabled, bot_token, chat_id, allowed_chat_ids, send_file):
+def _apply_tg_network(cfg: dict) -> None:
+    tg.configure_network(
+        cfg.get("proxy_mode", "direct"),
+        cfg.get("proxy_url", ""),
+        cfg.get("proxy_user", ""),
+        cfg.get("proxy_password", ""),
+    )
+
+
+def _save_config(
+    server_config,
+    server_config_filename,
+    *,
+    enabled,
+    bot_enabled,
+    bot_token,
+    chat_id,
+    allowed_chat_ids,
+    send_file,
+    proxy_mode,
+    proxy_url,
+    proxy_user,
+    proxy_password,
+):
     server_config[_ENABLED_KEY] = enabled
     server_config[_BOT_ENABLED_KEY] = bot_enabled
     server_config[_BOT_TOKEN_KEY] = bot_token.strip()
     server_config[_CHAT_ID_KEY] = chat_id.strip()
     server_config[_ALLOWED_IDS_KEY] = allowed_chat_ids.strip()
     server_config[_SEND_FILE_KEY] = send_file
+    server_config[_PROXY_MODE_KEY] = (proxy_mode or "direct").strip().lower()
+    server_config[_PROXY_URL_KEY] = proxy_url.strip()
+    server_config[_PROXY_USER_KEY] = proxy_user.strip()
+    server_config[_PROXY_PASSWORD_KEY] = proxy_password or ""
     if server_config_filename:
         try:
             with open(server_config_filename, "w", encoding="utf-8") as f:
@@ -131,7 +173,9 @@ class TelegramNotifyPlugin(WAN2GPPlugin):
 
     def _get_cfg(self):
         sc = getattr(self, "server_config", None) or {}
-        return _load_config(sc)
+        cfg = _load_config(sc)
+        _apply_tg_network(cfg)
+        return cfg
 
     def _maybe_start_bot(self):
         cfg = self._get_cfg()
@@ -270,6 +314,42 @@ class TelegramNotifyPlugin(WAN2GPPlugin):
                     placeholder="111111111, 222222222",
                 )
 
+            with gr.Accordion("Proxy (Telegram API only)", open=False):
+                gr.Markdown(
+                    "Used only for Telegram Bot API traffic (not for WanGP generation). "
+                    "**Direct** avoids broken system SOCKS proxies (WinError 10054). "
+                    "For **SOCKS5**, install once: `pip install PySocks` in the WanGP venv."
+                )
+                _mode_labels = {val: label for label, val in _PROXY_MODE_CHOICES}
+                _mode_values = {label: val for label, val in _PROXY_MODE_CHOICES}
+                _current_mode = cfg["proxy_mode"] if cfg["proxy_mode"] in _mode_labels else "direct"
+                proxy_mode_dd = gr.Dropdown(
+                    label="Proxy mode",
+                    choices=[label for label, _ in _PROXY_MODE_CHOICES],
+                    value=_mode_labels[_current_mode],
+                )
+                proxy_url_tb = gr.Textbox(
+                    label="Proxy address (host:port)",
+                    value=cfg["proxy_url"],
+                    placeholder="127.0.0.1:7890",
+                )
+                with gr.Row():
+                    proxy_user_tb = gr.Textbox(
+                        label="Proxy login (optional)",
+                        value=cfg["proxy_user"],
+                        placeholder="username",
+                    )
+                    proxy_password_tb = gr.Textbox(
+                        label="Proxy password (optional)",
+                        value=cfg["proxy_password"],
+                        placeholder="password",
+                        type="password",
+                    )
+                gr.Markdown(
+                    "You can also put credentials in the address: "
+                    "`login:password@127.0.0.1:7890` (fields above override if both are set)."
+                )
+
             with gr.Accordion("Notifications", open=True):
                 enabled_cb = gr.Checkbox(label="Enable completion notifications", value=cfg["enabled"])
                 send_file_cb = gr.Checkbox(
@@ -296,31 +376,56 @@ class TelegramNotifyPlugin(WAN2GPPlugin):
             status_md = gr.Markdown("")
             bot_status_md = gr.Markdown(self._bot_status_line())
 
-        def save(enabled, bot_enabled, bot_token, chat_id, allowed_chat_ids, send_file):
+        _proxy_mode_values = {label: val for label, val in _PROXY_MODE_CHOICES}
+
+        def save(
+            enabled, bot_enabled, bot_token, chat_id, allowed_chat_ids, send_file,
+            proxy_mode_label, proxy_url, proxy_user, proxy_password,
+        ):
             sc = getattr(self, "server_config", None) or {}
             scf = getattr(self, "server_config_filename", "") or ""
+            proxy_mode = _proxy_mode_values.get(proxy_mode_label, "direct")
             _save_config(
                 sc, scf,
                 enabled=enabled, bot_enabled=bot_enabled, bot_token=bot_token,
                 chat_id=chat_id, allowed_chat_ids=allowed_chat_ids, send_file=send_file,
+                proxy_mode=proxy_mode, proxy_url=proxy_url,
+                proxy_user=proxy_user, proxy_password=proxy_password,
             )
+            _apply_tg_network(_load_config(sc))
             self._maybe_start_bot()
             return "✅ Settings saved.", self._bot_status_line()
 
-        def test_notify(bot_token, chat_id):
+        def test_notify(bot_token, chat_id, proxy_mode_label, proxy_url, proxy_user, proxy_password):
             token = bot_token.strip()
             cid = chat_id.strip()
             if not token or not cid:
                 return "⚠️ Please enter Bot Token and Chat ID first."
+            _apply_tg_network({
+                "proxy_mode": _proxy_mode_values.get(proxy_mode_label, "direct"),
+                "proxy_url": proxy_url,
+                "proxy_user": proxy_user,
+                "proxy_password": proxy_password,
+            })
             ok, result = tg.send_message(token, cid, "✅ WAN2GP Telegram — test message!")
             return "✅ Test message sent!" if ok else f"❌ Failed: {result}"
 
         save_btn.click(
             fn=save,
-            inputs=[enabled_cb, bot_enabled_cb, bot_token_tb, chat_id_tb, allowed_ids_tb, send_file_cb],
+            inputs=[
+                enabled_cb, bot_enabled_cb, bot_token_tb, chat_id_tb, allowed_ids_tb, send_file_cb,
+                proxy_mode_dd, proxy_url_tb, proxy_user_tb, proxy_password_tb,
+            ],
             outputs=[status_md, bot_status_md],
         )
-        test_btn.click(fn=test_notify, inputs=[bot_token_tb, chat_id_tb], outputs=[status_md])
+        test_btn.click(
+            fn=test_notify,
+            inputs=[
+                bot_token_tb, chat_id_tb, proxy_mode_dd, proxy_url_tb,
+                proxy_user_tb, proxy_password_tb,
+            ],
+            outputs=[status_md],
+        )
 
     def _bot_status_line(self):
         return "🟢 Control bot is running." if self._bot.running else "⚪ Control bot is stopped."
